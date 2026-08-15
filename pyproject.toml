@@ -1,0 +1,12 @@
+[project]
+name = "vgkv"
+version = "0.1.0"
+description = "Value-guided KV cache retention engine"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"

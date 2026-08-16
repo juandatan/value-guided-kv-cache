@@ -123,6 +123,82 @@ Status: not yet started. Will log each approach tried, what worked/didn't, and w
     etc. — matches the reshape here, but confirm against
     `model.config.num_attention_heads / num_key_value_heads` on first run).
 
+- **2026-08-16 — first real GPU run on L40S; fixed eval-pipeline bugs found
+  during smoke testing, not model/value-model bugs.**
+  - Confirmed decode loop matches `model.generate()` exactly on greedy decoding
+    (byte-for-byte identical output) — the eager-attention custom loop and
+    the GQA reshape assumption in `record_step`/`EntropySaliencePolicy` are
+    both correct on real DeepSeek-R1-Distill-Qwen-7B attention tensors.
+  - R1-Distill's `<think>` traces are long enough that `max_new_tokens=256`
+    (initial smoke-test default) truncates before reaching a `#### <answer>`
+    line on most GSM8K problems — every policy scored 0% accuracy in the
+    first tight-budget run purely because of this, not because of eviction
+    quality. Bumped default `max_new_tokens` to 1536 in the notebook.
+  - Found and fixed a regex bug in `eval/gsm8k.py`: `BOXED_OR_LAST_NUMBER_RE`
+    (`-?[\d,]+(?:\.\d+)?`) could match a lone comma with no digits (e.g. mid-
+    sentence punctuation in a truncated generation), and stripping the comma
+    left an empty string that crashed `float()`. This only surfaced once
+    truncated/malformed generations became common (tight-budget runs).
+    Fixed by requiring a leading digit: `-?\d[\d,]*(?:\.\d+)?`.
+  - Found a fairness bug in the original notebook's comparison loop:
+    `NoEviction` was being run at the *same* tight budget as the other
+    policies. Since `NoEviction.score()` returns a uniform score for every
+    token, `evict_to_budget` still evicts once `seq_len > budget` (it only
+    skips eviction when `seq_len <= budget`), and ties get broken by
+    `torch.topk`'s arbitrary order — so "no_eviction" was silently behaving
+    like a near-random policy instead of a true full-cache upper bound.
+    Fixed by giving `no_eviction` its own large budget (`FULL_BUDGET`),
+    decoupled from the tight-budget sweep applied to the other policies.
+  - Added `eval/runner.py` (`PolicySpec`, `run_policy_eval`, `summarize`) to
+    scale from single-example spot checks to a multi-example, multi-budget
+    sweep with results logged to `results/gsm8k_policy_sweep.csv` and an
+    accuracy-vs-budget plot. Policies are constructed via a factory per
+    example (not a shared instance) because `EntropySaliencePolicy` keeps
+    per-sequence attention accumulator state on the policy object itself —
+    reusing one instance across examples would leak attention mass between
+    unrelated problems.
+  - Not yet run: the actual accuracy-vs-budget sweep at scale (only n=5 smoke
+    tested so far). Next session: run with `EVAL_N` bumped toward the full
+    1319-example test set and see whether `entropy_salience` beats `h2o` at
+    any point on the curve.
+
+- **2026-08-16 — diagnosed and fixed a real confound: all evictable policies
+  scored 0% at budget=128, while no_eviction scored ~60%.** Root cause was
+  the eviction setup, not policy quality:
+  - `sink_size=4` protected only the first 4 tokens of the *prompt*, leaving
+    ~86-96 tokens of the actual GSM8K problem statement (the numbers in the
+    word problem) sitting in the same evictable pool as generated reasoning
+    tokens. At budget=128 that left ~24-34 slots total shared between
+    leftover-prompt and the entire multi-hundred-token chain-of-thought —
+    tight enough to corrupt reasoning regardless of which policy was
+    choosing what to evict. This explains why random/recency/h2o/entropy
+    all flatlined at exactly 0%: the comparison was never reaching the
+    point where policy quality could matter.
+  - Fix: added `DecodeConfig.protect_prompt` (default `True`) — sink now
+    covers the *entire* prompt, so eviction only ever competes over which
+    generated tokens to keep. This matches how H2O/StreamingLLM are
+    normally evaluated (short protected prefix, eviction within a long
+    generated continuation) — our GSM8K prompts are short but fact-dense,
+    so losing them wasn't a fair test of eviction policy at all.
+  - Also added `DecodeConfig.generation_budget` (an alternative to the
+    absolute `budget` field): expresses budget as "how many generated
+    tokens survive eviction," independent of prompt length. Needed because
+    GSM8K prompt lengths vary per example — a fixed absolute `budget` would
+    give longer-prompt examples less generation headroom than
+    shorter-prompt ones, confounding any accuracy-vs-budget comparison
+    across examples. `effective_budget = prompt_len + generation_budget`
+    when set. `PolicySpec`/`run_policy_eval` in `eval/runner.py` now take
+    `generation_budget` instead of `budget` for this reason.
+  - Verified the fix in isolation with synthetic attention tensors (no GPU
+    needed): after N decode steps beyond a P-token prompt with
+    `generation_budget=B`, cache length correctly stabilizes at exactly
+    `P + B` with the prompt region never evicted.
+  - Not yet re-validated on the GPU with real generations — next step is to
+    re-run the tight-budget comparison (now `TIGHT_GENERATION_BUDGET=384` in
+    the notebook, chosen as a starting point well above the previous
+    failure point) and confirm policies actually separate from each other
+    instead of uniformly failing.
+
 ## 7. Decisions log
 
 - 2026-08-15: Chose DeepSeek-R1-Distill-Qwen-7B over Qwen2.5-Math-7B or plain

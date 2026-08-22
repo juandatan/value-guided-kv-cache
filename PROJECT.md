@@ -2,6 +2,44 @@
 
 Running design doc + decision log. Update this as we go, don't let it drift from code.
 
+## 0. Background: how KV caching fits into token generation
+
+**Prefill vs. decode.** Generation happens in two phases. *Prefill* is a single forward
+pass over the entire prompt at once (`decode.py`'s first `model(...)` call, `input_ids`
+= full prompt) — every prompt position's K/V is computed in parallel and written into
+the KV cache, and only the last position's logits are used (to produce the first
+generated token). *Decode* is everything after: one token at a time, `input_ids` = just
+the newly sampled token, reusing `past_key_values` for every prior position. Decode
+can't be parallelized across positions the way prefill can, since each token depends on
+the previous one having already been sampled.
+
+**Why the KV cache exists.** Attention needs K/V for every previous position on every
+step. Recomputing those from scratch each decode step would mean re-running the full
+prompt + all-generated-so-far through every layer at every step (O(n^2) total work).
+The KV cache stores each layer's K/V tensors so a decode step only computes K/V for the
+one new token and reuses everything else — O(n) total work instead. This is also
+exactly *why* eviction is interesting: the cache is a growing, addressable buffer (per
+layer, per KV head, indexed by position) that we can shrink by dropping positions we
+judge low-value, rather than an opaque intermediate we're stuck materializing in full.
+
+**Softmax and the cache as the *only* visible context.** Inside each attention layer,
+`softmax(Q @ K^T / sqrt(d))` normalizes over exactly the key positions currently present
+in that layer's KV cache (`kv_len` = `state.seq_len(layer_idx)`). Whatever isn't in the
+cache is invisible to the model on that step — not summarized, not approximated, just
+absent, as if it had never been generated. This has a direct consequence for eviction:
+removing a token doesn't just make it unavailable, it also *shrinks the softmax
+denominator* for every future step, so surviving tokens can mechanically gain attention
+mass simply because a competitor was removed — independent of whether they became more
+important. Any policy that accumulates post-hoc attention mass (H2O, our
+entropy-salience policy) inherits this bias.
+
+**GQA relevance.** Attention tensors are shaped `[batch, num_q_heads, q_len, kv_len]`,
+but the KV cache itself only has `num_kv_heads` slots (fewer than `num_q_heads` under
+grouped-query attention). Eviction has to operate at KV-head granularity — decisions
+must be made per cache slot, aggregating attention across the `group_size` query heads
+that share each KV head (`attn.view(batch, num_kv_heads, group_size, q_len, kv_len)`),
+not per query head.
+
 ## 1. Goal
 
 Replace recency/frequency-based KV cache eviction (LRU/LFU, StreamingLLM sink+window,

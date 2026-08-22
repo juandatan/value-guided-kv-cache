@@ -9,3 +9,4 @@ jupyter
 ipywidgets
 networkx
 tqdm
+kaggle

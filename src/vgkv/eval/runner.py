@@ -4,6 +4,7 @@ Sweeps a set of policies across a GSM8K subset and returns per-example results
 plus an aggregated summary (accuracy, throughput, peak KV cache memory).
 """
 
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -37,6 +38,8 @@ def run_policy_eval(
     log_every: int = 1,
     checkpoint_path: str | Path | None = None,
     resume: bool = True,
+    force: bool = False,
+    transcripts_path: str | Path | None = None,
     kaggle_dataset_slug: str | None = None,
     kaggle_title: str = "vgkv GSM8K policy sweep results",
     kaggle_upload_every: int = 20,
@@ -72,6 +75,22 @@ def run_policy_eval(
     dataset order might differ slightly between the interrupted and resumed
     calls.
 
+    force, if True, ignores and deletes any existing checkpoint_path /
+    transcripts_path before starting -- every run is redone from scratch and
+    both files are overwritten rather than appended to. Use this when you
+    want fresh transcripts for examples that are already checkpointed (the
+    plain resume path skips them, so their transcripts would never get
+    written), or when a checkpoint is suspected corrupt/stale. Takes
+    precedence over resume.
+
+    transcripts_path, if set, appends one JSON line per (example, policy) run
+    containing the full generated text alongside the same identifying columns
+    as checkpoint_path -- kept as a separate file rather than a column on
+    checkpoint_path since full 1536-token transcripts would bloat every
+    checkpoint write/upload; this file is meant for offline inspection (e.g.
+    reading truncated generations to see why they didn't reach an answer),
+    not for the accuracy/throughput summary.
+
     kaggle_dataset_slug, if set, pushes checkpoint_path to that Kaggle dataset
     (creating it on the first checkpoint, versioning it on every subsequent
     one) every kaggle_upload_every completed runs -- deliberately coarser
@@ -80,6 +99,12 @@ def run_policy_eval(
     fired after every single generation. Requires the `kaggle` CLI and
     credentials configured -- see vgkv.kaggle_utils.
     """
+    if force:
+        for path in (checkpoint_path, transcripts_path):
+            if path is not None and Path(path).exists():
+                logger.info("force=True: deleting existing %s", path)
+                Path(path).unlink()
+
     rows = []
     done_keys: set[tuple[int, str, int]] = set()
     if checkpoint_path is not None and Path(checkpoint_path).exists():
@@ -125,6 +150,27 @@ def run_policy_eval(
                 **metrics.as_dict(),
             }
             rows.append(row)
+
+            if transcripts_path is not None:
+                transcripts_path = Path(transcripts_path)
+                transcripts_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(transcripts_path, "a") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "example_idx": idx,
+                                "policy": spec.name,
+                                "generation_budget": spec.generation_budget,
+                                "correct": correct,
+                                "generated_tokens": metrics.generated_tokens,
+                                "question": example["question"],
+                                "gold_answer": example["answer"],
+                                "generated_text": text,
+                            }
+                        )
+                        + "\n"
+                    )
+
             if verbose:
                 print(
                     f"[{idx}] {spec.name}: correct={correct} "

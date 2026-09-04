@@ -30,10 +30,23 @@ class RandomPolicy(EvictionPolicy):
 
 
 class RecencyPolicy(EvictionPolicy):
-    """LRU-style baseline: score = last_used_step (higher = more recently used = keep)."""
+    """Sliding-window recency baseline: keep the newest cache positions.
+
+    Cache slots remain in chronological order after eviction because
+    ManagedKVCache sorts keep indices before applying them and each decoded
+    token is appended at the end. Scoring by slot index therefore implements
+    a true "keep the most recent tokens" baseline.
+
+    The previous implementation used ``last_used_step``, but dense softmax
+    attention gives nearly every cached token positive attention at every
+    step. That made nearly all tokens tie as "recently used" and reduced the
+    policy to arbitrary ``topk`` tie-breaking rather than recency.
+    """
 
     def score(self, state: CacheState, layer_idx: int) -> torch.Tensor:
-        return state.layers[layer_idx].last_used_step.float()
+        seq_len = state.seq_len(layer_idx)
+        device = state.layers[layer_idx].attn_accum.device
+        return torch.arange(seq_len, device=device, dtype=torch.float32)
 
 
 class H2OPolicy(EvictionPolicy):

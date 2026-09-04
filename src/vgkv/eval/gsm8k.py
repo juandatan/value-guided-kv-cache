@@ -40,8 +40,25 @@ def extract_predicted_answer(generated_text: str) -> float | None:
     return None
 
 
-def is_correct(generated_text: str, example: dict) -> bool:
-    pred = extract_predicted_answer(generated_text)
-    if pred is None:
+def extract_strict_predicted_answer(generated_text: str) -> float | None:
+    """Extract only an answer explicitly emitted after the requested ``####`` tag."""
+    match = ANSWER_TAG_RE.search(generated_text)
+    if match:
+        return float(match.group(1).replace(",", ""))
+    return None
+
+
+def _matches_gold(predicted: float | None, example: dict) -> bool:
+    if predicted is None:
         return False
-    return abs(pred - gold_answer(example)) < 1e-4
+    return abs(predicted - gold_answer(example)) < 1e-4
+
+
+def is_correct(generated_text: str, example: dict) -> bool:
+    """Permissive accuracy: explicit ``####`` answer, or the final number as fallback."""
+    return _matches_gold(extract_predicted_answer(generated_text), example)
+
+
+def is_strict_correct(generated_text: str, example: dict) -> bool:
+    """Strict accuracy: require the requested explicit ``#### <number>`` answer."""
+    return _matches_gold(extract_strict_predicted_answer(generated_text), example)

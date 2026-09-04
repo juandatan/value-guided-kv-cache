@@ -14,7 +14,7 @@ from typing import Callable
 import pandas as pd
 
 from vgkv.decode import DecodeConfig, generate_with_policy
-from vgkv.eval.gsm8k import build_prompt, is_correct
+from vgkv.eval.gsm8k import build_prompt, is_correct, is_strict_correct
 from vgkv.value_models.base import EvictionPolicy
 
 logger = logging.getLogger(__name__)
@@ -110,6 +110,11 @@ def run_policy_eval(
     if checkpoint_path is not None and Path(checkpoint_path).exists():
         if resume:
             existing = pd.read_csv(checkpoint_path)
+            if "strict_correct" not in existing.columns:
+                raise ValueError(
+                    f"checkpoint {checkpoint_path} predates the strict accuracy metric; "
+                    "start a fresh run with force=True"
+                )
             rows = existing.to_dict("records")
             done_keys = set(
                 zip(existing["example_idx"], existing["policy"], existing["generation_budget"])
@@ -142,11 +147,13 @@ def run_policy_eval(
             )
             text, metrics = generate_with_policy(model, tokenizer, prompt, policy, cfg)
             correct = is_correct(text, example)
+            strict_correct = is_strict_correct(text, example)
             row = {
                 "example_idx": idx,
                 "policy": spec.name,
                 "generation_budget": spec.generation_budget,
                 "correct": correct,
+                "strict_correct": strict_correct,
                 **metrics.as_dict(),
             }
             rows.append(row)
@@ -162,6 +169,7 @@ def run_policy_eval(
                                 "policy": spec.name,
                                 "generation_budget": spec.generation_budget,
                                 "correct": correct,
+                                "strict_correct": strict_correct,
                                 "generated_tokens": metrics.generated_tokens,
                                 "question": example["question"],
                                 "gold_answer": example["answer"],
@@ -228,6 +236,7 @@ def summarize(results: pd.DataFrame) -> pd.DataFrame:
         .agg(
             n=("correct", "size"),
             accuracy=("correct", "mean"),
+            strict_accuracy=("strict_correct", "mean"),
             avg_tok_s=("decode_tokens_per_sec", "mean"),
             avg_peak_kv_mb=("peak_kv_cache_mb", "mean"),
             avg_prefill_s=("prefill_time_s", "mean"),

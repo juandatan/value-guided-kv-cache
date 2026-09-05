@@ -74,6 +74,7 @@ def generate_with_policy(model, tokenizer, prompt: str, policy, config: DecodeCo
     eos_token_id = config.eos_token_id if config.eos_token_id is not None else tokenizer.eos_token_id
 
     generated_ids: list[int] = []
+    prefill_cache_position = torch.arange(prompt_len, device=device, dtype=torch.long)
 
     with Timer() as t_prefill:
         with torch.no_grad():
@@ -82,13 +83,15 @@ def generate_with_policy(model, tokenizer, prompt: str, policy, config: DecodeCo
                 past_key_values=mkv.cache,
                 use_cache=True,
                 output_attentions=True,
+                cache_position=prefill_cache_position,
+                position_ids=prefill_cache_position.unsqueeze(0),
             )
     metrics.prefill_time_s = t_prefill.elapsed
 
     if is_entropy_policy:
         for layer_idx, attn in enumerate(out.attentions):
             policy.accumulate_step(layer_idx, attn, num_kv_heads)
-    mkv.record_step(out.attentions, step=0)
+    mkv.record_step(out.attentions, step=0, cache_position=prefill_cache_position)
     mkv.evict_to_budget(policy, effective_budget)
 
     next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
@@ -100,6 +103,13 @@ def generate_with_policy(model, tokenizer, prompt: str, policy, config: DecodeCo
         if eos_token_id is not None and generated_ids[-1] == eos_token_id:
             break
 
+        # The token fed on decode step 1 is the first generated token, whose
+        # absolute position is prompt_len. Keep incrementing this independently
+        # of the physical cache length: after eviction, DynamicCache.get_seq_length()
+        # is capped and cannot be used to infer the next RoPE position.
+        absolute_position = prompt_len + step - 1
+        cache_position = torch.tensor([absolute_position], device=device, dtype=torch.long)
+
         with Timer() as t_step:
             with torch.no_grad():
                 out = model(
@@ -107,13 +117,15 @@ def generate_with_policy(model, tokenizer, prompt: str, policy, config: DecodeCo
                     past_key_values=mkv.cache,
                     use_cache=True,
                     output_attentions=True,
+                    cache_position=cache_position,
+                    position_ids=cache_position.unsqueeze(0),
                 )
         decode_elapsed += t_step.elapsed
 
         if is_entropy_policy:
             for layer_idx, attn in enumerate(out.attentions):
                 policy.accumulate_step(layer_idx, attn, num_kv_heads)
-        mkv.record_step(out.attentions, step=step)
+        mkv.record_step(out.attentions, step=step, cache_position=cache_position)
         mkv.evict_to_budget(policy, effective_budget)
 
         next_token = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)

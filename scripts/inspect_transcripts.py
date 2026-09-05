@@ -50,6 +50,18 @@ def has_answer_line(text: str) -> bool:
     return re.search(r"####\s*-?\d", text) is not None
 
 
+def strict_correct(row: dict) -> bool:
+    if "strict_correct" in row:
+        return bool(row["strict_correct"])
+    predicted = re.search(r"####\s*(-?\d[\d,]*(?:\.\d+)?)", row["generated_text"])
+    gold = re.search(r"####\s*(-?\d[\d,]*(?:\.\d+)?)", row["gold_answer"])
+    if predicted is None or gold is None:
+        return False
+    predicted_value = float(predicted.group(1).replace(",", ""))
+    gold_value = float(gold.group(1).replace(",", ""))
+    return abs(predicted_value - gold_value) < 1e-4
+
+
 def summarize_group(rows: list[dict]) -> dict:
     n = len(rows)
     if n == 0:
@@ -59,6 +71,7 @@ def summarize_group(rows: list[dict]) -> dict:
     return {
         "n": n,
         "accuracy": sum(r["correct"] for r in rows) / n,
+        "strict_accuracy": sum(strict_correct(r) for r in rows) / n,
         "pct_no_answer_line": len(truncated) / n,
         "avg_generated_tokens": sum(r["generated_tokens"] for r in rows) / n,
         "avg_8gram_repetition_ratio": sum(rep_ratios) / n,
@@ -88,11 +101,15 @@ def main() -> None:
     for r in rows:
         by_policy_budget.setdefault((r["policy"], r["generation_budget"]), []).append(r)
 
-    print(f"{'policy':<20}{'budget':>8}{'n':>5}{'acc':>8}{'no_answer%':>12}{'avg_gen_tok':>13}{'avg_8gram_rep':>15}")
+    print(
+        f"{'policy':<20}{'budget':>8}{'n':>5}{'acc':>8}{'strict':>9}"
+        f"{'no_answer%':>12}{'avg_gen_tok':>13}{'avg_8gram_rep':>15}"
+    )
     for (policy, budget), group in sorted(by_policy_budget.items()):
         s = summarize_group(group)
         print(
             f"{policy:<20}{budget:>8}{s['n']:>5}{s['accuracy']:>8.2f}"
+            f"{s['strict_accuracy']:>9.2f}"
             f"{100 * s['pct_no_answer_line']:>11.1f}%{s['avg_generated_tokens']:>13.1f}"
             f"{s['avg_8gram_repetition_ratio']:>15.3f}"
         )

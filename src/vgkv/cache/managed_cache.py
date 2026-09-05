@@ -76,11 +76,21 @@ class ManagedKVCache:
                 )
             )
 
-    def record_step(self, attentions: tuple[torch.Tensor, ...], step: int) -> None:
+    def record_step(
+        self,
+        attentions: tuple[torch.Tensor, ...],
+        step: int,
+        cache_position: torch.Tensor | None = None,
+    ) -> None:
         """Update per-token attention bookkeeping after a forward pass.
 
         attentions: tuple of length num_layers, each [batch, num_q_heads, q_len, kv_len].
         Assumes batch size 1 (single-sequence decode loop).
+
+        cache_position contains the absolute position(s) of the newly appended
+        token(s). It must be supplied by eviction-aware decode loops because
+        the physical cache length stops increasing after eviction and no
+        longer identifies the true sequence position.
         """
         self.state.step = step
         for layer_idx, attn in enumerate(attentions):
@@ -104,7 +114,16 @@ class ManagedKVCache:
                 layer_state.attn_accum = torch.cat([layer_state.attn_accum, pad], dim=-1)
                 pad_pos = torch.zeros(kv_len - prev_len, dtype=torch.long, device=device)
                 layer_state.last_used_step = torch.cat([layer_state.last_used_step, pad_pos], dim=-1)
-                new_positions = torch.arange(prev_len, kv_len, device=device, dtype=torch.long)
+                new_count = kv_len - prev_len
+                if cache_position is None:
+                    new_positions = torch.arange(prev_len, kv_len, device=device, dtype=torch.long)
+                else:
+                    new_positions = cache_position.to(device=device, dtype=torch.long).reshape(-1)
+                    if new_positions.numel() != new_count:
+                        raise ValueError(
+                            f"cache_position has {new_positions.numel()} entries but "
+                            f"{new_count} new cache slots were appended"
+                        )
                 layer_state.position_ids = torch.cat([layer_state.position_ids, new_positions], dim=-1)
 
             layer_state.attn_accum += mass
